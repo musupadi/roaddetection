@@ -1,6 +1,8 @@
+import 'dart:io';
+
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:image_picker/image_picker.dart'; // Tambahkan ini
+import 'package:image_picker/image_picker.dart';
 import 'package:roaddetection/Constant/Colors.dart';
 import 'package:tflite_v2/tflite_v2.dart';
 
@@ -16,10 +18,12 @@ class Scanner extends StatefulWidget {
 class _ScannerState extends State<Scanner> {
   CameraController? cameraController;
   bool isDetecting = false;
-  bool isDialogShowing = false; // Tambahkan ini untuk melacak apakah dialog terbuka
+  bool isDialogShowing = false;
+  bool isGalleryImage = false; // Track if a gallery image is displayed
   var _recognitions = [];
   String result = '';
-  int selectedCameraIndex = 0; // Untuk melacak kamera depan/belakang
+  int selectedCameraIndex = 0;
+  String? uploadedImagePath;
 
   @override
   void initState() {
@@ -39,27 +43,32 @@ class _ScannerState extends State<Scanner> {
     }
   }
 
-  void initializeCamera() {
-    cameraController = CameraController(
-      widget.cameras[selectedCameraIndex],
-      ResolutionPreset.medium,
-    );
+  Future<void> initializeCamera() async {
+    try {
+      // Ensure previous controller is disposed before reinitializing
+      await cameraController?.dispose();
 
-    cameraController!.initialize().then((_) {
-      if (!mounted) {
-        return;
-      }
+      cameraController = CameraController(
+        widget.cameras[selectedCameraIndex],
+        ResolutionPreset.medium,
+      );
+
+      await cameraController!.initialize();
+      if (!mounted) return;
       setState(() {});
 
-      cameraController!.startImageStream((CameraImage img) {
-        if (!isDetecting && !isDialogShowing) { // Deteksi hanya jika tidak ada dialog
-          isDetecting = true;
-          detectImage(img);
-        }
-      });
-    }).catchError((e) {
+      // Start the image stream only if not displaying a gallery image
+      if (!isGalleryImage) {
+        cameraController!.startImageStream((CameraImage img) {
+          if (!isDetecting && !isDialogShowing) {
+            isDetecting = true;
+            detectImage(img);
+          }
+        });
+      }
+    } catch (e) {
       print("Error initializing camera: $e");
-    });
+    }
   }
 
   Future<void> detectImage(CameraImage image) async {
@@ -86,26 +95,25 @@ class _ScannerState extends State<Scanner> {
       int endTime = DateTime.now().millisecondsSinceEpoch;
       print("Inference took ${endTime - startTime}ms");
 
-      // Cek apakah ada yang lebih dari 90%
       if (recognitions != null && recognitions.isNotEmpty) {
         for (var recog in recognitions) {
           double confidence = recog["confidence"] ?? 0.0;
           String label = recog["label"] ?? 'Unknown';
           if (confidence > 0.9) {
-            await _showHighConfidenceDialog(label, confidence); // Menunggu hingga dialog ditutup
-            break; // Hentikan setelah dialog ditampilkan
+            await _showHighConfidenceDialog(label, confidence);
+            break;
           }
         }
       }
     } catch (e) {
       print("Error during image detection: $e");
     } finally {
-      isDetecting = false; // Set kembali ke false untuk memulai deteksi selanjutnya
+      isDetecting = false;
     }
   }
 
   Future<void> _showHighConfidenceDialog(String label, double confidence) async {
-    isDialogShowing = true; // Tandai bahwa dialog sedang tampil
+    isDialogShowing = true;
     await showDialog(
       context: context,
       builder: (BuildContext context) {
@@ -124,12 +132,23 @@ class _ScannerState extends State<Scanner> {
         );
       },
     );
-    isDialogShowing = false; // Set kembali ke false setelah dialog ditutup
+    isDialogShowing = false;
+    isDetecting = true;
+
+    // 5-second delay before allowing the next detection
+    await Future.delayed(const Duration(seconds: 5));
+    isDetecting = false;
   }
 
   void switchCamera() {
     selectedCameraIndex = selectedCameraIndex == 0 ? 1 : 0;
-    initializeCamera();
+    resetCamera();
+  }
+
+  Future<void> resetCamera() async {
+    uploadedImagePath = null;
+    isGalleryImage = false;
+    await initializeCamera();
   }
 
   Future<void> pickImageFromGallery() async {
@@ -138,10 +157,35 @@ class _ScannerState extends State<Scanner> {
 
     if (pickedFile != null) {
       setState(() {
+        uploadedImagePath = pickedFile.path;
         result = "Gambar dari galeri dipilih.";
+        isGalleryImage = true;
       });
 
-      // Tambahkan logika untuk memproses gambar yang diambil dari galeri
+      // Stop the camera preview when a gallery image is used
+      await cameraController?.stopImageStream();
+
+      var recognitions = await Tflite.runModelOnImage(
+        path: pickedFile.path,
+        numResults: 6,
+        threshold: 0.05,
+        imageMean: 127.5,
+        imageStd: 127.5,
+      );
+
+      setState(() {
+        _recognitions = recognitions ?? [];
+        result = recognitions?.isNotEmpty == true ? recognitions.toString() : "No object detected";
+      });
+
+      if (recognitions != null && recognitions.isNotEmpty) {
+        for (var recog in recognitions) {
+          double confidence = recog["confidence"] ?? 0.0;
+          String label = recog["label"] ?? 'Unknown';
+          await _showHighConfidenceDialog(label, confidence);
+          break;
+        }
+      }
     }
   }
 
@@ -154,32 +198,37 @@ class _ScannerState extends State<Scanner> {
 
   @override
   Widget build(BuildContext context) {
-    if (cameraController == null || !cameraController!.value.isInitialized) {
-      return const Center(child: CircularProgressIndicator());
-    }
-
     var size = MediaQuery.of(context).size;
     return Scaffold(
       appBar: AppBar(
         iconTheme: const IconThemeData(
-          color: Colors.white, // Mengubah warna tombol back menjadi putih
+          color: Colors.white,
         ),
         title: const Text('Road Detector', style: TextStyle(color: Colors.white)),
         backgroundColor: PrimaryColors(),
         actions: [
           IconButton(
             icon: Icon(Icons.camera_front, color: Colors.white),
-            onPressed: switchCamera, // Ganti kamera depan/belakang
+            onPressed: switchCamera,
           ),
           IconButton(
             icon: Icon(Icons.photo_library, color: Colors.white),
-            onPressed: pickImageFromGallery, // Ambil gambar dari galeri
+            onPressed: pickImageFromGallery,
           ),
         ],
       ),
       body: Stack(
         children: <Widget>[
-          CameraPreview(cameraController!),
+          isGalleryImage && uploadedImagePath != null
+              ? Image.file(
+            File(uploadedImagePath!),
+            fit: BoxFit.cover,
+            width: size.width,
+            height: size.height,
+          )
+              : (cameraController != null && cameraController!.value.isInitialized
+              ? CameraPreview(cameraController!)
+              : const Center(child: CircularProgressIndicator())),
           Align(
             alignment: Alignment.bottomCenter,
             child: Container(
